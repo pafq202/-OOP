@@ -30,7 +30,7 @@ pip install -r requirements.txt
 ```
 
 ### 3. 환경 설정
-`.env` 파일의 토큰을 설정하세요:
+`.env` 파일을 생성하고 다음을 추가하세요:
 ```
 DISCORD_TOKEN=YOUR_BOT_TOKEN_HERE
 ```
@@ -420,7 +420,7 @@ pending_recruitment = 30
 
 ## ⚠️ 주의사항
 
-- `.env` 파일은 Git에서 추적하므로 실제 토큰을 입력한 변경 사항을 커밋하거나 GitHub에 올리지 마세요.
+- `.env` 파일은 절대 GitHub에 올리지 마세요 (토큰 노출 위험)
 - 봇을 초대할 때 다음 권한이 필요합니다:
   - ✅ 채널 보기
   - ✅ 메시지 보내기
