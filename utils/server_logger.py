@@ -74,7 +74,7 @@ async def save_server_info(bot: discord.ext.commands.Bot):
         
         # 파일 내용 작성
         content = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        content += "📊 HRD Clan Bot - 서버 정보\n"
+        content += "📊 모집공고2 - 서버 정보\n"
         content += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
         # 봇 정보
