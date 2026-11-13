@@ -18,7 +18,10 @@ comment_parser = get_config("comment")
 recruitment_messages = {}
 
 # 초대 링크
-INVITE_LINK = "https://discord.com/oauth2/authorize?client_id=1529528450157641779"
+INVITE_LINK = (
+    "https://discord.com/oauth2/authorize?client_id=1570426237137059850"
+    "&permissions=216064&integration_type=0&scope=bot+applications.commands"
+)
 
 
 def _serialize_player_id(player) -> Optional[int]:
@@ -31,7 +34,7 @@ def _serialize_player_id(player) -> Optional[int]:
 
 
 def _natural_key(text: str):
-    """'SQUAD 2' < 'SQUAD 10' 처럼 숫자 순서대로 정렬하기 위한 키"""
+    """'채널 2' < '채널 10' 처럼 숫자 순서대로 정렬하기 위한 키"""
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
@@ -80,28 +83,17 @@ def set_guild_whitelist(guild_id: int, channel_ids: List[int]):
     save_voice_whitelist(data)
 
 
-def _get_squad_duo_voice_channels(guild: discord.Guild) -> List[discord.VoiceChannel]:
-    """구인 드롭다운에 노출할 음성 채널을 이름 순서대로 반환.
+def _get_recruitment_voice_channels(guild: discord.Guild) -> List[discord.VoiceChannel]:
+    """구인 드롭다운에 노출할 음성 채널 목록 반환.
 
-    화이트리스트가 설정된 서버는 화이트리스트 채널만 노출하고,
-    설정이 없으면 기존처럼 이름에 SQUAD / DUO 가 포함된 채널만 노출한다.
+    화이트리스트에 등록된 채널만 등록한 순서대로 노출하며,
+    화이트리스트가 비어 있으면 어떤 음성 채널도 인식(노출)하지 않는다.
     """
-    whitelist = get_guild_whitelist(guild.id)
-    if whitelist:
-        whitelist_set = set(whitelist)
-        channels = [
-            channel
-            for channel in guild.channels
-            if isinstance(channel, discord.VoiceChannel) and channel.id in whitelist_set
-        ]
-    else:
-        channels = [
-            channel
-            for channel in guild.channels
-            if isinstance(channel, discord.VoiceChannel)
-            and ("squad" in channel.name.lower() or "duo" in channel.name.lower())
-        ]
-    channels.sort(key=lambda channel: _natural_key(channel.name))
+    channels = []
+    for channel_id in get_guild_whitelist(guild.id):
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.VoiceChannel):
+            channels.append(channel)
     return channels
 
 
@@ -143,7 +135,14 @@ async def is_admin_or_owner(interaction: discord.Interaction) -> bool:
 
 
 async def can_manage_recruitment(interaction: discord.Interaction, data: Optional[dict]) -> bool:
-    """작성자 본인 또는 관리자/서버 주인인지 확인"""
+    """같은 서버의 구인 공고에 한해, 작성자 본인 또는 관리자/서버 주인인지 확인"""
+    data_guild_id = (data or {}).get("guild_id")
+    if (
+        data_guild_id is not None
+        and interaction.guild is not None
+        and data_guild_id != interaction.guild.id
+    ):
+        return False
     if await is_admin_or_owner(interaction):
         return True
     author_id = (data or {}).get("author_id")
@@ -151,12 +150,19 @@ async def can_manage_recruitment(interaction: discord.Interaction, data: Optiona
 
 
 async def get_manageable_recruitments(interaction: discord.Interaction, battle_data: dict) -> dict:
-    """요청한 유저가 관리할 수 있는 구인만 반환"""
-    if await is_admin_or_owner(interaction):
-        return dict(battle_data)
-    return {
+    """요청한 유저가 현재 서버에서 관리할 수 있는 구인만 반환"""
+    guild_id = interaction.guild.id if interaction.guild else None
+    # 현재 서버에서 만들어진 구인만 노출
+    guild_data = {
         message_id: data
         for message_id, data in battle_data.items()
+        if data.get("guild_id") == guild_id
+    }
+    if await is_admin_or_owner(interaction):
+        return guild_data
+    return {
+        message_id: data
+        for message_id, data in guild_data.items()
         if data.get("author_id") is not None and data.get("author_id") == interaction.user.id
     }
 
@@ -170,7 +176,9 @@ class BattleView(discord.ui.View):
         game_type: str = "미정",
         max_players: int = 4,
         voice_channel: str = "미정",
+        voice_channel_id: int = None,
         author_id: int = None,
+        guild_id: int = None,
     ):
         super().__init__(timeout=None)
         self.message_id = message_id
@@ -178,7 +186,9 @@ class BattleView(discord.ui.View):
         self.game_type = game_type
         self.max_players = max_players
         self.voice_channel = voice_channel
+        self.voice_channel_id = voice_channel_id
         self.author_id = author_id
+        self.guild_id = guild_id
         self.players = [None] * max_players
 
         if message_id:
@@ -188,6 +198,8 @@ class BattleView(discord.ui.View):
                 player_ids = data.get("players", [])
                 self.players = _normalize_players(player_ids, max_players)
                 self.author_id = data.get("author_id", self.author_id)
+                self.guild_id = data.get("guild_id") or self.guild_id
+                self.voice_channel_id = self.voice_channel_id or data.get("voice_channel_id")
 
     def create_embed(self) -> discord.Embed:
         """구인 메시지 Embed 생성"""
@@ -202,12 +214,17 @@ class BattleView(discord.ui.View):
 
         author_line = f"✍️ 작성자: <@{self.author_id}>\n" if self.author_id else ""
 
+        # 채널 ID가 있으면 클릭 시 바로 입장 가능한 멘션으로 표시
+        voice_display = (
+            f"<#{self.voice_channel_id}>" if self.voice_channel_id else self.voice_channel
+        )
+
         description = (
             "🎮 BATTLEGROUND\n"
             f"{author_line}"
             f"게임 시간: {self.game_time}\n"
             f"게임종류: {self.game_type}\n"
-            f"📍 음성채널: {self.voice_channel}\n"
+            f"📍 음성채널: {voice_display} (클릭하여 바로 입장)\n"
             f"모집 인원: {self.max_players}명\n\n"
             "참여인원\n"
             + "\n".join(player_lines)
@@ -231,7 +248,9 @@ class BattleView(discord.ui.View):
             "game_type": self.game_type,
             "max_players": self.max_players,
             "voice_channel": self.voice_channel,
+            "voice_channel_id": self.voice_channel_id,
             "author_id": self.author_id,
+            "guild_id": self.guild_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         save_battle_data(battle_data)
@@ -464,7 +483,7 @@ class VoiceChannelSelect(discord.ui.Select):
         self.session_token = session_token
         self.voice_channel_interaction = voice_channel_interaction
 
-        voice_channels = _get_squad_duo_voice_channels(guild)[:25]
+        voice_channels = _get_recruitment_voice_channels(guild)[:25]
         options = [
             discord.SelectOption(label=f"🎮 {channel.name}"[:100], value=str(channel.id))
             for channel in voice_channels
@@ -472,7 +491,7 @@ class VoiceChannelSelect(discord.ui.Select):
 
         super().__init__(
             placeholder="음성 채널을 선택하세요...",
-            options=options if options else [discord.SelectOption(label="음성 채널 없음", value="none")],
+            options=options if options else [discord.SelectOption(label="등록된 음성 채널 없음 (/설정 필요)", value="none")],
             custom_id="voice_channel_select",
             disabled=len(options) == 0,
         )
@@ -489,9 +508,9 @@ class VoiceChannelSelect(discord.ui.Select):
 
         if self.values[0] == "none":
             await interaction.response.send_message(
-                "❌ 사용 가능한 음성 채널이 없습니다!",
+                "❌ 등록된 음성 채널이 없습니다! 관리자가 `/설정`으로 화이트리스트에 채널을 등록해야 합니다.",
                 ephemeral=True,
-                delete_after=3,
+                delete_after=5,
             )
             return
 
@@ -500,6 +519,7 @@ class VoiceChannelSelect(discord.ui.Select):
 
         if channel:
             session["recruitment_settings"]["voice_channel"] = f"#{channel.name}"
+            session["recruitment_settings"]["voice_channel_id"] = channel.id
 
             if self.voice_channel_interaction:
                 try:
@@ -615,6 +635,7 @@ class EditState:
         self.game_type = "미정"
         self.player_count = 0
         self.voice_channel = "미정"
+        self.voice_channel_id = None
         self.notifications = []
         self.done = False
 
@@ -688,22 +709,27 @@ class EditVoiceChannelSelect(discord.ui.Select):
 
         options = [
             discord.SelectOption(label=f"🎮 {channel.name}"[:100], value=str(channel.id))
-            for channel in _get_squad_duo_voice_channels(guild)[:25]
+            for channel in _get_recruitment_voice_channels(guild)[:25]
         ]
         super().__init__(
             placeholder="음성 채널을 선택하세요...",
-            options=options if options else [discord.SelectOption(label="음성 채널 없음", value="none")],
+            options=options if options else [discord.SelectOption(label="등록된 음성 채널 없음 (/설정 필요)", value="none")],
             disabled=len(options) == 0,
         )
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "none":
-            await interaction.response.send_message("❌ 사용 가능한 음성 채널이 없습니다!", ephemeral=True, delete_after=3)
+            await interaction.response.send_message(
+                "❌ 등록된 음성 채널이 없습니다! 관리자가 `/설정`으로 화이트리스트에 채널을 등록해야 합니다.",
+                ephemeral=True,
+                delete_after=5,
+            )
             return
         channel = self.guild.get_channel(int(self.values[0]))
         if not channel:
             return
         self.state.voice_channel = f"#{channel.name}"
+        self.state.voice_channel_id = channel.id
         try:
             await self.channel_interaction.delete_original_response()
         except Exception:
@@ -797,13 +823,15 @@ class WhitelistSelect(discord.ui.Select):
                 channel = interaction.guild.get_channel(channel_id)
                 names.append(f"#{channel.name}" if channel else str(channel_id))
             description = (
-                f"✅ 구인 목록에 보일 음성 채널을 {len(selected)}개로 설정했습니다!\n\n"
+                f"✅ 구인 목록에 보일 음성 채널을 {len(selected)}개로 설정했습니다!\n"
+                "(아래 순서대로 드롭다운에 표시됩니다)\n\n"
                 + "\n".join(names)
             )
         else:
             description = (
                 "✅ 화이트리스트를 비웠습니다.\n"
-                "이제 기본 동작(이름에 SQUAD/DUO가 포함된 채널만 노출)으로 돌아갑니다."
+                "이제 구인 드롭다운에 **어떤 음성 채널도 표시되지 않습니다.**\n"
+                "`/설정`으로 채널을 다시 등록해주세요."
             )
 
         embed = discord.Embed(
@@ -815,16 +843,17 @@ class WhitelistSelect(discord.ui.Select):
 
 
 class WhitelistResetButton(discord.ui.Button):
-    """화이트리스트 초기화(전체 보이기) 버튼"""
+    """화이트리스트 초기화(전체 해제) 버튼"""
     def __init__(self):
-        super().__init__(label="전체 보이기(초기화)", style=discord.ButtonStyle.red)
+        super().__init__(label="전체 해제(초기화)", style=discord.ButtonStyle.red)
 
     async def callback(self, interaction: discord.Interaction):
         set_guild_whitelist(interaction.guild.id, [])
         embed = discord.Embed(
             title="🎧 음성 채널 설정 완료",
             description="✅ 화이트리스트를 초기화했습니다.\n"
-            "이제 기본 동작(이름에 SQUAD/DUO가 포함된 채널만 노출)으로 돌아갑니다.",
+            "이제 구인 드롭다운에 **어떤 음성 채널도 표시되지 않습니다.**\n"
+            "`/설정`으로 채널을 다시 등록해주세요.",
             color=discord.Color.green(),
         )
         await interaction.response.edit_message(embed=embed, view=None)
@@ -852,6 +881,7 @@ class Recruitment(commands.Cog):
                 "game_type": "미정",
                 "player_count": 0,
                 "voice_channel": "미정",
+                "voice_channel_id": None,
             },
             "settings_interaction": None,
             "recruiter": None,
@@ -926,6 +956,83 @@ class Recruitment(commands.Cog):
         view = SettingsView(cog=self, user_id=user_id, session_token=session["session_token"])
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+    @discord.app_commands.command(name="빠른양식", description="파라미터 입력으로 배틀그라운드 구인 바로 시작")
+    @discord.app_commands.describe(
+        시간="게임 시간 (예: 오후 9시)",
+        종류="게임 종류 (예: 일반, 경쟁)",
+        인원="모집 인원",
+        채널="구인에 표시할 음성 채널",
+    )
+    @discord.app_commands.choices(
+        인원=[
+            discord.app_commands.Choice(name="듀오 (2명)", value=2),
+            discord.app_commands.Choice(name="트리오 (3명)", value=3),
+            discord.app_commands.Choice(name="스쿼드 (4명)", value=4),
+        ]
+    )
+    async def quick_recruitment_slash(
+        self,
+        interaction: discord.Interaction,
+        시간: str,
+        종류: str,
+        인원: int,
+        채널: str,
+    ):
+        """슬래시 명령어: /빠른양식 - 버튼 없이 파라미터 입력만으로 구인 시작"""
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ 서버에서만 사용할 수 있습니다.", ephemeral=True, delete_after=5
+            )
+            return
+
+        voice_channel = next(
+            (c for c in _get_recruitment_voice_channels(guild) if c.name == 채널),
+            None,
+        )
+        if voice_channel is None:
+            await interaction.response.send_message(
+                f"❌ 음성 채널 '{채널}'을(를) 찾을 수 없습니다.\n"
+                "화이트리스트에 등록된 채널만 사용할 수 있습니다. (관리자: `/설정`)",
+                ephemeral=True,
+                delete_after=5,
+            )
+            return
+
+        user_id = interaction.user.id
+        self.session_counter += 1
+        self.sessions[user_id] = self._new_session(self.session_counter)
+        session = self.sessions[user_id]
+        session["settings_interaction"] = interaction
+        session["interaction_channel"] = interaction.channel
+        session["recruiter"] = interaction.user
+        session["recruitment_settings"].update(
+            {
+                "game_time": 시간,
+                "game_type": 종류,
+                "player_count": 인원,
+                "voice_channel": f"#{voice_channel.name}",
+                "voice_channel_id": voice_channel.id,
+            }
+        )
+
+        await interaction.response.send_message("🚀 구인을 시작합니다...", ephemeral=True)
+        await self.start_recruitment(user_id, interaction)
+
+    @quick_recruitment_slash.autocomplete("채널")
+    async def quick_recruitment_channel_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ):
+        guild = interaction.guild
+        if guild is None:
+            return []
+        current_lower = current.lower()
+        return [
+            discord.app_commands.Choice(name=channel.name[:100], value=channel.name[:100])
+            for channel in _get_recruitment_voice_channels(guild)
+            if current_lower in channel.name.lower()
+        ][:25]
+
     async def start_recruitment(self, user_id: int, interaction: discord.Interaction):
         """구인 메시지 자동 발송"""
         session = self.get_session(user_id)
@@ -958,7 +1065,9 @@ class Recruitment(commands.Cog):
             game_type=recruitment_settings.get("game_type", "미정"),
             max_players=player_count,
             voice_channel=recruitment_settings.get("voice_channel", "미정"),
+            voice_channel_id=recruitment_settings.get("voice_channel_id"),
             author_id=recruiter.id if recruiter else None,
+            guild_id=interaction.guild.id if interaction.guild else None,
         )
 
         try:
@@ -1222,7 +1331,10 @@ class Recruitment(commands.Cog):
                 game_type=state.game_type,
                 max_players=state.player_count,
                 voice_channel=state.voice_channel,
+                voice_channel_id=state.voice_channel_id,
                 author_id=data.get("author_id"),
+                guild_id=data.get("guild_id")
+                or (interaction.guild.id if interaction.guild else None),
             )
             message = await state.channel.fetch_message(int(state.message_id))
             await message.edit(embed=view.create_embed(), view=view)
@@ -1255,15 +1367,15 @@ class Recruitment(commands.Cog):
                 pass
         await interaction.followup.send("✅ 구인 공고가 수정되었습니다!", ephemeral=True)
 
-    @discord.app_commands.command(name="초대링크", description="HRD Clan Bot 초대 링크 공유")
+    @discord.app_commands.command(name="초대링크", description="모집공고2 초대 링크 공유")
     @discord.app_commands.check(is_admin_or_owner)
     async def invite_link(self, interaction: discord.Interaction):
-        """슬래시 명령어: /초대링크 - HRD Clan Bot 초대 링크를 공유 (관리자 또는 서버 주인만 사용 가능)"""
+        """슬래시 명령어: /초대링크 - 모집공고2 초대 링크를 공유 (관리자 또는 서버 주인만 사용 가능)"""
         embed = discord.Embed(
-            title="🔗 HRD Clan Bot 초대 링크",
+            title="🔗 모집공고2 초대 링크",
             description="아래 링크를 클릭하여 봇을 서버에 초대하세요!\n\n"
-            "✅ 봇 권한: 메세지 보내기, 모두 멘션하기, 링크 임베드\n"
-            "✅ 메세지 보내기 및 멘션 기능정도만 작동합니다",
+            "✅ 봇 권한(최소): 채널 보기, 메시지 보내기, 링크 임베드, 메시지 기록 보기, 모두 멘션하기\n"
+            "✅ 구인 공고 게시 및 멘션 기능에 필요한 권한만 요청합니다",
             color=discord.Color.blue(),
             url=INVITE_LINK,
         )
@@ -1271,10 +1383,11 @@ class Recruitment(commands.Cog):
         embed.add_field(
             name="🚀 빠른 시작",
             value="1. 위의 링크를 클릭하여 봇 초대\n"
-            "2. `/양식` 명령어로 구인 시작\n"
-            "3. `/수정` 명령어로 본인 구인 공고 설정 변경\n"
-            "4. `/삭제` 명령어로 본인 구인 공고 삭제\n"
-            "5. 팀원들과 함께 플레이!",
+            "2. `/양식` (버튼 설정) 또는 `/빠른양식` (파라미터 입력)으로 구인 시작\n"
+            "3. `/설정` 명령어로 구인에 표시할 음성 채널 지정 (관리자 전용)\n"
+            "4. `/수정` 명령어로 본인 구인 공고 설정 변경\n"
+            "5. `/삭제` 명령어로 본인 구인 공고 삭제\n"
+            "6. 팀원들과 함께 플레이!",
             inline=False,
         )
 
@@ -1308,10 +1421,11 @@ class Recruitment(commands.Cog):
         current = get_guild_whitelist(guild.id)
 
         description = (
-            "구인 목록(`/양식`, `/수정`)의 음성 채널 드롭다운에 **보여줄 채널만** 선택하세요.\n"
-            "선택한 채널만 노출됩니다. (화이트리스트 방식)\n\n"
-            "• 아무 것도 선택하지 않고 저장하거나 **전체 보이기(초기화)** 를 누르면\n"
-            "  기본 동작(이름에 SQUAD/DUO가 포함된 채널만 노출)으로 돌아갑니다."
+            "구인 목록(`/양식`, `/빠른양식`, `/수정`)의 음성 채널 드롭다운에 **보여줄 채널만** 선택하세요.\n"
+            "선택한 채널만, **선택한 순서대로** 노출됩니다. (화이트리스트 방식)\n\n"
+            "⚠️ 화이트리스트에 등록하지 않은 음성 채널은 **인식되지 않습니다.**\n"
+            "• 아무 것도 선택하지 않고 저장하거나 **전체 해제(초기화)** 를 누르면\n"
+            "  어떤 음성 채널도 드롭다운에 표시되지 않습니다."
         )
         if len(voice_channels) > 25:
             description += f"\n\n⚠️ 음성 채널이 {len(voice_channels)}개라 처음 25개만 표시됩니다."
